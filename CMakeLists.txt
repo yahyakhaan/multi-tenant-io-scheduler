@@ -12,6 +12,7 @@ find_package(Threads REQUIRED)
 
 add_library(ioshield_core
     src/drr_scheduler.cpp
+    src/file_block_device.cpp
     src/fifo_scheduler.cpp
     src/metrics.cpp
     src/rate_limited_scheduler.cpp
@@ -57,5 +58,10 @@ add_executable(ioshield_phase3_tests tests/phase3_tests.cpp)
 target_link_libraries(ioshield_phase3_tests PRIVATE ioshield_core)
 ioshield_enable_warnings(ioshield_phase3_tests)
 add_test(NAME phase3 COMMAND ioshield_phase3_tests)
+
+add_executable(ioshield_phase4_tests tests/phase4_tests.cpp)
+target_link_libraries(ioshield_phase4_tests PRIVATE ioshield_core)
+ioshield_enable_warnings(ioshield_phase4_tests)
+add_test(NAME phase4 COMMAND ioshield_phase4_tests)
 
 

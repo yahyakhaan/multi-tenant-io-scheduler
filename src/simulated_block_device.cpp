@@ -61,6 +61,7 @@ bool SimulatedBlockDevice::submit(IORequest request, CompletionCallback completi
 
     jobs_.push_back(Job{std::move(request), Clock::now(), std::move(completion)});
     ++in_flight_;
+    ++submitted_;
     lock.unlock();
     jobs_ready_.notify_one();
     return true;
@@ -87,6 +88,18 @@ void SimulatedBlockDevice::close() {
             worker.join();
         }
     }
+}
+
+DeviceStats SimulatedBlockDevice::stats() const {
+    std::lock_guard lock(mutex_);
+    return DeviceStats{
+        .submitted = submitted_.load(),
+        .completed = completed_.load(),
+        .errors = errors_.load(),
+        .busy_time_ns = busy_time_ns_.load(),
+        .in_flight = in_flight_,
+        .lanes = config_.lanes,
+    };
 }
 
 std::chrono::nanoseconds SimulatedBlockDevice::service_time(const IORequest& request) const {
@@ -123,14 +136,19 @@ void SimulatedBlockDevice::worker_loop() {
             jobs_.pop_front();
         }
 
+        const auto service_started = Clock::now();
         std::this_thread::sleep_for(service_time(job.request));
-        IOCompletion result{
+        const auto service_finished = Clock::now();
+        ++completed_;
+        busy_time_ns_.fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                service_finished - service_started).count()));
+        job.completion(IOCompletion{
             .request = std::move(job.request),
             .status = IOStatus::Ok,
             .dispatched_at = job.dispatched_at,
-            .completed_at = Clock::now(),
-        };
-        job.completion(std::move(result));
+            .completed_at = service_finished,
+        });
 
         {
             std::lock_guard lock(mutex_);

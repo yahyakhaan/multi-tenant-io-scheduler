@@ -2,6 +2,7 @@
 
 #include "ioshield/block_device.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +34,7 @@ public:
     bool submit(IORequest request, CompletionCallback completion) override;
     void wait_idle() override;
     void close() override;
+    [[nodiscard]] DeviceStats stats() const override;
 
     [[nodiscard]] const SimulatedDeviceConfig& config() const noexcept { return config_; }
 
@@ -47,7 +49,7 @@ private:
     void worker_loop();
 
     SimulatedDeviceConfig config_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable jobs_ready_;
     std::condition_variable capacity_available_;
     std::condition_variable idle_;
@@ -55,6 +57,10 @@ private:
     std::vector<std::thread> workers_;
     std::size_t in_flight_{0};
     bool closed_{false};
+    std::atomic<std::uint64_t> submitted_{0};
+    std::atomic<std::uint64_t> completed_{0};
+    std::atomic<std::uint64_t> errors_{0};
+    std::atomic<std::uint64_t> busy_time_ns_{0};
 };
 
 }  // namespace ioshield

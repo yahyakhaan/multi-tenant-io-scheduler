@@ -89,11 +89,18 @@ DualTokenBucket::DualTokenBucket(
     : operations_(iops_per_second, operation_burst, initial_time),
       bytes_(bytes_per_second, byte_burst, initial_time) {}
 
+bool DualTokenBucket::can_consume(
+    double operations,
+    double bytes,
+    Clock::time_point now) {
+    return operations_.can_consume(operations, now) && bytes_.can_consume(bytes, now);
+}
+
 bool DualTokenBucket::try_consume(
     double operations,
     double bytes,
     Clock::time_point now) {
-    if (!operations_.can_consume(operations, now) || !bytes_.can_consume(bytes, now)) {
+    if (!can_consume(operations, bytes, now)) {
         return false;
     }
     const bool operation_consumed = operations_.try_consume(operations, now);

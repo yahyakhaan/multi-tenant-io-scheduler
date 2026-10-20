@@ -39,6 +39,7 @@ public:
         double byte_burst,
         Clock::time_point initial_time = Clock::now());
 
+    [[nodiscard]] bool can_consume(double operations, double bytes, Clock::time_point now);
     bool try_consume(double operations, double bytes, Clock::time_point now);
     [[nodiscard]] std::chrono::nanoseconds time_until_available(
         double operations,

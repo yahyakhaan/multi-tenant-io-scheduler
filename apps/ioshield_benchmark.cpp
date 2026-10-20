@@ -1,15 +1,19 @@
 #include "ioshield/drr_scheduler.hpp"
+#include "ioshield/file_block_device.hpp"
 #include "ioshield/fifo_scheduler.hpp"
 #include "ioshield/metrics.hpp"
 #include "ioshield/rate_limited_scheduler.hpp"
 #include "ioshield/simulated_block_device.hpp"
 #include "ioshield/workload.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -20,6 +24,11 @@ namespace {
 
 struct Options {
     std::string scheduler{"fifo"};
+    std::string device{"simulated"};
+    std::string file_path{"ioshield-benchmark.dat"};
+    std::string file_durability{"buffered"};
+    std::string time_series_path;
+    std::uint64_t file_size_mib{1024};
     double duration_seconds{3.0};
     double tenant_a_iops{6'000.0};
     double tenant_b_iops{500.0};
@@ -41,6 +50,11 @@ void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n"
         << "  --scheduler fifo|token-bucket|drr\n"
+        << "  --device simulated|file\n"
+        << "  --file-path PATH\n"
+        << "  --file-size-mib SIZE\n"
+        << "  --file-durability buffered|fsync\n"
+        << "  --timeseries PATH\n"
         << "  --duration SECONDS\n"
         << "  --tenant-a-iops RATE\n"
         << "  --tenant-b-iops RATE\n"
@@ -72,6 +86,16 @@ Options parse_options(int argc, char** argv) {
         const std::string value = argv[++i];
         if (argument == "--scheduler") {
             options.scheduler = value;
+        } else if (argument == "--device") {
+            options.device = value;
+        } else if (argument == "--file-path") {
+            options.file_path = value;
+        } else if (argument == "--file-size-mib") {
+            options.file_size_mib = std::stoull(value);
+        } else if (argument == "--file-durability") {
+            options.file_durability = value;
+        } else if (argument == "--timeseries") {
+            options.time_series_path = value;
         } else if (argument == "--duration") {
             options.duration_seconds = std::stod(value);
         } else if (argument == "--tenant-a-iops") {
@@ -108,17 +132,48 @@ Options parse_options(int argc, char** argv) {
     }
     const bool scheduler_valid = options.scheduler == "fifo" ||
         options.scheduler == "token-bucket" || options.scheduler == "drr";
+    const bool device_valid = options.device == "simulated" || options.device == "file";
+    const bool durability_valid =
+        options.file_durability == "buffered" || options.file_durability == "fsync";
     const bool limits_valid = options.tenant_a_limit_iops > 0.0 &&
         options.tenant_b_limit_iops > 0.0 &&
         options.tenant_a_limit_mib_per_sec > 0.0 &&
         options.tenant_b_limit_mib_per_sec > 0.0 && options.burst_requests >= 1.0 &&
         options.tenant_a_weight > 0 && options.tenant_b_weight > 0 &&
         options.drr_quantum_bytes > 0;
-    if (!scheduler_valid || options.duration_seconds <= 0.0 || options.lanes == 0 ||
-        !limits_valid) {
+    constexpr std::uint64_t kBytesPerMebibyte = 1024ULL * 1024ULL;
+    const bool file_size_valid = options.file_size_mib > 0 &&
+        options.file_size_mib <=
+            std::numeric_limits<std::uint64_t>::max() / kBytesPerMebibyte;
+    if (!scheduler_valid || !device_valid || !durability_valid ||
+        options.duration_seconds <= 0.0 || options.lanes == 0 || !file_size_valid ||
+        options.file_path.empty() || !limits_valid) {
         throw std::invalid_argument("invalid scheduler or non-positive benchmark setting");
     }
     return options;
+}
+
+void write_time_series(
+    const std::string& path,
+    const std::string& scheduler,
+    const std::string& device,
+    const std::vector<ioshield::TimeSeriesPoint>& points) {
+    if (path.empty()) {
+        return;
+    }
+    std::ofstream output(path);
+    if (!output) {
+        throw std::runtime_error("unable to open time-series output: " + path);
+    }
+    output << "scheduler,device,window,tenant,completed,errors,ops_per_sec,mib_per_sec,"
+              "total_p95_us,total_p99_us\n";
+    output << std::fixed << std::setprecision(2);
+    for (const auto& point : points) {
+        output << scheduler << ',' << device << ',' << point.window_index << ','
+               << point.tenant_id << ',' << point.completed << ',' << point.errors << ','
+               << point.operations_per_second << ',' << point.mebibytes_per_second << ','
+               << point.total_p95_us << ',' << point.total_p99_us << '\n';
+    }
 }
 
 }  // namespace
@@ -131,12 +186,17 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(options.duration_seconds));
+        constexpr std::uint64_t kBytesPerMebibyteInteger = 1024ULL * 1024ULL;
+        const std::uint64_t working_set_bytes = options.device == "file"
+            ? options.file_size_mib * kBytesPerMebibyteInteger
+            : 1ULL << 30;
 
         WorkloadConfig tenant_a{
             .tenant_id = "tenant-a-noisy",
             .offered_iops = options.tenant_a_iops,
             .duration = duration,
             .request_size_bytes = 4 * 1024,
+            .working_set_bytes = working_set_bytes,
             .read_ratio = 0.8,
             .arrival_pattern = ArrivalPattern::Fixed,
             .access_pattern = AccessPattern::Random,
@@ -148,6 +208,7 @@ int main(int argc, char** argv) {
             .offered_iops = options.tenant_b_iops,
             .duration = duration,
             .request_size_bytes = 4 * 1024,
+            .working_set_bytes = working_set_bytes,
             .read_ratio = 1.0,
             .arrival_pattern = ArrivalPattern::Fixed,
             .access_pattern = AccessPattern::Random,
@@ -207,17 +268,34 @@ int main(int argc, char** argv) {
         }
 
         MetricsCollector metrics;
-        SimulatedBlockDevice device(SimulatedDeviceConfig{
-            .max_iops = options.device_iops,
-            .max_bandwidth_mib_per_sec = options.device_mib_per_sec,
-            .base_latency = 100us,
-            .lanes = options.lanes,
-            .queue_depth = options.lanes,
-        });
+        std::unique_ptr<IBlockDevice> device;
+        std::string device_label;
+        if (options.device == "simulated") {
+            device = std::make_unique<SimulatedBlockDevice>(SimulatedDeviceConfig{
+                .max_iops = options.device_iops,
+                .max_bandwidth_mib_per_sec = options.device_mib_per_sec,
+                .base_latency = 100us,
+                .lanes = options.lanes,
+                .queue_depth = options.lanes,
+            });
+            device_label = "simulated";
+        } else {
+            const auto durability = options.file_durability == "fsync"
+                ? FileDurability::FsyncPerWrite
+                : FileDurability::Buffered;
+            device = std::make_unique<FileBlockDevice>(FileDeviceConfig{
+                .path = options.file_path,
+                .size_bytes = working_set_bytes,
+                .lanes = options.lanes,
+                .queue_depth = options.lanes,
+                .durability = durability,
+            });
+            device_label = options.file_durability == "fsync" ? "file-fsync" : "file-buffered";
+        }
 
         std::thread dispatcher([&] {
             while (auto request = scheduler->wait_dequeue()) {
-                if (!device.submit(
+                if (!device->submit(
                         std::move(*request),
                         [&](IOCompletion completion) { metrics.record(completion); })) {
                     break;
@@ -229,28 +307,70 @@ int main(int argc, char** argv) {
         for (auto& scheduled : workload) {
             std::this_thread::sleep_until(started_at + scheduled.scheduled_after);
             scheduled.request.submitted_at = started_at + scheduled.scheduled_after;
+            const IORequest metric_request = scheduled.request;
+            metrics.record_submission(metric_request);
             if (!scheduler->enqueue(std::move(scheduled.request))) {
+                metrics.record_rejection(metric_request);
                 throw std::runtime_error("scheduler closed while producing workload");
             }
         }
 
-        const auto measurement_elapsed = Clock::now() - started_at;
+        const auto measurement_ended_at = Clock::now();
+        const auto measurement_elapsed = measurement_ended_at - started_at;
         const auto measurement_summaries = metrics.summarize(measurement_elapsed);
+        const auto time_series = metrics.summarize_windows(
+            started_at,
+            measurement_ended_at,
+            1s);
+        const auto device_stats = device->stats();
+
+        std::vector<double> allocations;
+        std::vector<double> normalized_allocations;
+        allocations.reserve(measurement_summaries.size());
+        normalized_allocations.reserve(measurement_summaries.size());
+        for (const auto& summary : measurement_summaries) {
+            allocations.push_back(summary.mebibytes_per_second);
+            double weight = 1.0;
+            if (options.scheduler == "drr") {
+                weight = summary.tenant_id == "tenant-a-noisy"
+                    ? static_cast<double>(options.tenant_a_weight)
+                    : static_cast<double>(options.tenant_b_weight);
+            }
+            normalized_allocations.push_back(summary.mebibytes_per_second / weight);
+        }
+        const double fairness = jains_fairness(allocations);
+        const double weighted_fairness = jains_fairness(normalized_allocations);
+        const double elapsed_ns = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(measurement_elapsed).count());
+        const double device_utilization = elapsed_ns > 0.0 && device_stats.lanes > 0
+            ? std::min(
+                  1.0,
+                  static_cast<double>(device_stats.busy_time_ns) /
+                      (elapsed_ns * static_cast<double>(device_stats.lanes)))
+            : 0.0;
+        write_time_series(options.time_series_path, options.scheduler, device_label, time_series);
+
         scheduler->close();
         dispatcher.join();
-        device.wait_idle();
-        device.close();
+        device->wait_idle();
+        device->close();
 
-        std::cout << "scheduler,tenant,completed,errors,ops_per_sec,mib_per_sec,"
-                     "queue_p50_us,queue_p95_us,queue_p99_us,total_p50_us,total_p95_us,total_p99_us\n";
+        std::cout << "scheduler,device,tenant,submitted,rejected,completed,errors,ops_per_sec,"
+                     "mib_per_sec,queue_p50_us,queue_p95_us,queue_p99_us,service_p50_us,"
+                     "service_p95_us,service_p99_us,total_p50_us,total_p95_us,total_p99_us,"
+                     "device_utilization,jain_fairness,weighted_jain_fairness\n";
         std::cout << std::fixed << std::setprecision(2);
         for (const auto& summary : measurement_summaries) {
-            std::cout << options.scheduler << ',' << summary.tenant_id << ',' << summary.completed << ','
+            std::cout << options.scheduler << ',' << device_label << ',' << summary.tenant_id << ','
+                      << summary.submitted << ',' << summary.rejected << ',' << summary.completed << ','
                       << summary.errors << ',' << summary.operations_per_second << ','
                       << summary.mebibytes_per_second << ',' << summary.queue_p50_us << ','
                       << summary.queue_p95_us << ',' << summary.queue_p99_us << ','
+                      << summary.service_p50_us << ',' << summary.service_p95_us << ','
+                      << summary.service_p99_us << ','
                       << summary.total_p50_us << ',' << summary.total_p95_us << ','
-                      << summary.total_p99_us << '\n';
+                      << summary.total_p99_us << ',' << device_utilization << ',' << fairness << ','
+                      << weighted_fairness << '\n';
         }
 
         if (metrics.completion_count() != workload.size()) {

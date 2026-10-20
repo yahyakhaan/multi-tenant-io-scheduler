@@ -1,5 +1,6 @@
 #include "ioshield/fifo_scheduler.hpp"
 #include "ioshield/metrics.hpp"
+#include "ioshield/rate_limited_scheduler.hpp"
 #include "ioshield/simulated_block_device.hpp"
 #include "ioshield/workload.hpp"
 
@@ -8,6 +9,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -16,11 +18,17 @@
 namespace {
 
 struct Options {
+    std::string scheduler{"fifo"};
     double duration_seconds{3.0};
     double tenant_a_iops{6'000.0};
     double tenant_b_iops{500.0};
     double device_iops{5'000.0};
     double device_mib_per_sec{250.0};
+    double tenant_a_limit_iops{3'000.0};
+    double tenant_b_limit_iops{500.0};
+    double tenant_a_limit_mib_per_sec{12.0};
+    double tenant_b_limit_mib_per_sec{2.0};
+    double burst_requests{32.0};
     std::size_t lanes{1};
     std::uint64_t seed{42};
 };
@@ -28,11 +36,17 @@ struct Options {
 void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n"
+        << "  --scheduler fifo|token-bucket\n"
         << "  --duration SECONDS\n"
         << "  --tenant-a-iops RATE\n"
         << "  --tenant-b-iops RATE\n"
         << "  --device-iops RATE\n"
         << "  --device-mibps RATE\n"
+        << "  --tenant-a-limit-iops RATE\n"
+        << "  --tenant-b-limit-iops RATE\n"
+        << "  --tenant-a-limit-mibps RATE\n"
+        << "  --tenant-b-limit-mibps RATE\n"
+        << "  --burst-requests COUNT\n"
         << "  --lanes COUNT\n"
         << "  --seed VALUE\n";
 }
@@ -49,7 +63,9 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("missing value for " + argument);
         }
         const std::string value = argv[++i];
-        if (argument == "--duration") {
+        if (argument == "--scheduler") {
+            options.scheduler = value;
+        } else if (argument == "--duration") {
             options.duration_seconds = std::stod(value);
         } else if (argument == "--tenant-a-iops") {
             options.tenant_a_iops = std::stod(value);
@@ -59,6 +75,16 @@ Options parse_options(int argc, char** argv) {
             options.device_iops = std::stod(value);
         } else if (argument == "--device-mibps") {
             options.device_mib_per_sec = std::stod(value);
+        } else if (argument == "--tenant-a-limit-iops") {
+            options.tenant_a_limit_iops = std::stod(value);
+        } else if (argument == "--tenant-b-limit-iops") {
+            options.tenant_b_limit_iops = std::stod(value);
+        } else if (argument == "--tenant-a-limit-mibps") {
+            options.tenant_a_limit_mib_per_sec = std::stod(value);
+        } else if (argument == "--tenant-b-limit-mibps") {
+            options.tenant_b_limit_mib_per_sec = std::stod(value);
+        } else if (argument == "--burst-requests") {
+            options.burst_requests = std::stod(value);
         } else if (argument == "--lanes") {
             options.lanes = static_cast<std::size_t>(std::stoull(value));
         } else if (argument == "--seed") {
@@ -67,8 +93,15 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + argument);
         }
     }
-    if (options.duration_seconds <= 0.0 || options.lanes == 0) {
-        throw std::invalid_argument("duration and lane count must be positive");
+    const bool scheduler_valid = options.scheduler == "fifo" || options.scheduler == "token-bucket";
+    const bool limits_valid = options.tenant_a_limit_iops > 0.0 &&
+        options.tenant_b_limit_iops > 0.0 &&
+        options.tenant_a_limit_mib_per_sec > 0.0 &&
+        options.tenant_b_limit_mib_per_sec > 0.0 &&
+        options.burst_requests >= 1.0;
+    if (!scheduler_valid || options.duration_seconds <= 0.0 || options.lanes == 0 ||
+        !limits_valid) {
+        throw std::invalid_argument("invalid scheduler or non-positive benchmark setting");
     }
     return options;
 }
@@ -112,7 +145,31 @@ int main(int argc, char** argv) {
             WorkloadGenerator::generate(tenant_b),
         });
 
-        FifoScheduler scheduler;
+        constexpr double kBytesPerMebibyte = 1024.0 * 1024.0;
+        constexpr double kRequestBytes = 4.0 * 1024.0;
+        std::unique_ptr<IScheduler> scheduler;
+        if (options.scheduler == "fifo") {
+            scheduler = std::make_unique<FifoScheduler>();
+        } else {
+            scheduler = std::make_unique<RateLimitedScheduler>(
+                std::vector<TenantRateLimit>{
+                    {
+                        "tenant-a-noisy",
+                        options.tenant_a_limit_iops,
+                        options.burst_requests,
+                        options.tenant_a_limit_mib_per_sec * kBytesPerMebibyte,
+                        options.burst_requests * kRequestBytes,
+                    },
+                    {
+                        "tenant-b-latency",
+                        options.tenant_b_limit_iops,
+                        options.burst_requests,
+                        options.tenant_b_limit_mib_per_sec * kBytesPerMebibyte,
+                        options.burst_requests * kRequestBytes,
+                    },
+                });
+        }
+
         MetricsCollector metrics;
         SimulatedBlockDevice device(SimulatedDeviceConfig{
             .max_iops = options.device_iops,
@@ -123,7 +180,7 @@ int main(int argc, char** argv) {
         });
 
         std::thread dispatcher([&] {
-            while (auto request = scheduler.wait_dequeue()) {
+            while (auto request = scheduler->wait_dequeue()) {
                 if (!device.submit(
                         std::move(*request),
                         [&](IOCompletion completion) { metrics.record(completion); })) {
@@ -136,12 +193,12 @@ int main(int argc, char** argv) {
         for (auto& scheduled : workload) {
             std::this_thread::sleep_until(started_at + scheduled.scheduled_after);
             scheduled.request.submitted_at = started_at + scheduled.scheduled_after;
-            if (!scheduler.enqueue(std::move(scheduled.request))) {
+            if (!scheduler->enqueue(std::move(scheduled.request))) {
                 throw std::runtime_error("scheduler closed while producing workload");
             }
         }
 
-        scheduler.close();
+        scheduler->close();
         dispatcher.join();
         device.wait_idle();
         const auto finished_at = Clock::now();
@@ -152,7 +209,7 @@ int main(int argc, char** argv) {
                      "queue_p50_us,queue_p95_us,queue_p99_us,total_p50_us,total_p95_us,total_p99_us\n";
         std::cout << std::fixed << std::setprecision(2);
         for (const auto& summary : metrics.summarize(elapsed)) {
-            std::cout << "fifo," << summary.tenant_id << ',' << summary.completed << ','
+            std::cout << options.scheduler << ',' << summary.tenant_id << ',' << summary.completed << ','
                       << summary.errors << ',' << summary.operations_per_second << ','
                       << summary.mebibytes_per_second << ',' << summary.queue_p50_us << ','
                       << summary.queue_p95_us << ',' << summary.queue_p99_us << ','

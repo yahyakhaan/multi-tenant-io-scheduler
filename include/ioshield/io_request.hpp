@@ -18,6 +18,7 @@ enum class IOStatus : std::uint8_t {
     Ok,
     InvalidRequest,
     DeviceStopped,
+    IOError,
 };
 
 struct IORequest {

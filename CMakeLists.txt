@@ -64,4 +64,26 @@ target_link_libraries(ioshield_phase4_tests PRIVATE ioshield_core)
 ioshield_enable_warnings(ioshield_phase4_tests)
 add_test(NAME phase4 COMMAND ioshield_phase4_tests)
 
+add_executable(ioshield_phase5_tests tests/phase5_tests.cpp)
+target_link_libraries(ioshield_phase5_tests PRIVATE ioshield_core)
+ioshield_enable_warnings(ioshield_phase5_tests)
+add_test(NAME phase5 COMMAND ioshield_phase5_tests)
+
+add_test(
+    NAME phase5_spike_smoke
+    COMMAND ioshield_benchmark
+        --scheduler drr
+        --duration 0.2
+        --tenant-a-iops 100
+        --tenant-b-iops 50
+        --tenant-a-spike-after 0.1
+        --tenant-a-spike-multiplier 2
+        --tenant-a-request-kib 64
+        --tenant-a-access sequential
+        --tenant-a-limit-iops 1000
+        --tenant-b-limit-iops 1000
+        --tenant-a-limit-mibps 1000
+        --tenant-b-limit-mibps 1000
+)
+
 

@@ -3,4 +3,5 @@
 /.DS_Store
 *.csv
 *.dat
+/benchmark-results/
 

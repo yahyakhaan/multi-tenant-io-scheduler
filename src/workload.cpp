@@ -82,6 +82,43 @@ std::vector<ScheduledRequest> WorkloadGenerator::generate(const WorkloadConfig& 
     return requests;
 }
 
+std::vector<ScheduledRequest> WorkloadGenerator::generate_phased(
+    const WorkloadConfig& base_config,
+    const std::vector<WorkloadPhase>& phases) {
+    if (phases.empty()) {
+        throw std::invalid_argument("phased workload requires at least one phase");
+    }
+
+    std::vector<std::vector<ScheduledRequest>> generated;
+    generated.reserve(phases.size());
+    std::uint64_t next_request_id = base_config.request_id_base;
+
+    for (std::size_t index = 0; index < phases.size(); ++index) {
+        const auto& phase = phases[index];
+        if (phase.start_after < std::chrono::nanoseconds::zero() ||
+            phase.duration <= std::chrono::nanoseconds::zero() ||
+            !std::isfinite(phase.offered_iops) || phase.offered_iops <= 0.0) {
+            throw std::invalid_argument("workload phases require non-negative starts and positive rates");
+        }
+
+        WorkloadConfig phase_config = base_config;
+        phase_config.start_after = base_config.start_after + phase.start_after;
+        phase_config.duration = phase.duration;
+        phase_config.offered_iops = phase.offered_iops;
+        phase_config.seed = base_config.seed + static_cast<std::uint64_t>(index);
+        phase_config.request_id_base = next_request_id;
+
+        auto requests = generate(phase_config);
+        if (requests.size() >
+            std::numeric_limits<std::uint64_t>::max() - next_request_id) {
+            throw std::overflow_error("phased workload request IDs overflow 64 bits");
+        }
+        next_request_id += static_cast<std::uint64_t>(requests.size());
+        generated.push_back(std::move(requests));
+    }
+    return merge(std::move(generated));
+}
+
 std::vector<ScheduledRequest> WorkloadGenerator::merge(
     std::vector<std::vector<ScheduledRequest>> workloads) {
     std::size_t total = 0;

@@ -39,9 +39,18 @@ struct ScheduledRequest {
     IORequest request;
 };
 
+struct WorkloadPhase {
+    std::chrono::nanoseconds start_after{};
+    std::chrono::nanoseconds duration{std::chrono::seconds(1)};
+    double offered_iops{1'000.0};
+};
+
 class WorkloadGenerator {
 public:
     [[nodiscard]] static std::vector<ScheduledRequest> generate(const WorkloadConfig& config);
+    [[nodiscard]] static std::vector<ScheduledRequest> generate_phased(
+        const WorkloadConfig& base_config,
+        const std::vector<WorkloadPhase>& phases);
     [[nodiscard]] static std::vector<ScheduledRequest> merge(
         std::vector<std::vector<ScheduledRequest>> workloads);
 };

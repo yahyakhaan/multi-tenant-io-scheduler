@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -32,6 +33,8 @@ struct Options {
     double duration_seconds{3.0};
     double tenant_a_iops{6'000.0};
     double tenant_b_iops{500.0};
+    double tenant_a_spike_after_seconds{-1.0};
+    double tenant_a_spike_multiplier{2.0};
     double device_iops{5'000.0};
     double device_mib_per_sec{250.0};
     double tenant_a_limit_iops{3'000.0};
@@ -42,6 +45,10 @@ struct Options {
     std::uint32_t tenant_a_weight{1};
     std::uint32_t tenant_b_weight{1};
     std::size_t drr_quantum_bytes{4096};
+    std::size_t tenant_a_request_kib{4};
+    std::size_t tenant_b_request_kib{4};
+    std::string tenant_a_access{"random"};
+    std::string tenant_b_access{"random"};
     std::size_t lanes{1};
     std::uint64_t seed{42};
 };
@@ -58,6 +65,12 @@ void print_usage(const char* program) {
         << "  --duration SECONDS\n"
         << "  --tenant-a-iops RATE\n"
         << "  --tenant-b-iops RATE\n"
+        << "  --tenant-a-spike-after SECONDS (disabled by default)\n"
+        << "  --tenant-a-spike-multiplier FACTOR\n"
+        << "  --tenant-a-request-kib SIZE\n"
+        << "  --tenant-b-request-kib SIZE\n"
+        << "  --tenant-a-access random|sequential\n"
+        << "  --tenant-b-access random|sequential\n"
         << "  --device-iops RATE\n"
         << "  --device-mibps RATE\n"
         << "  --tenant-a-limit-iops RATE\n"
@@ -102,6 +115,18 @@ Options parse_options(int argc, char** argv) {
             options.tenant_a_iops = std::stod(value);
         } else if (argument == "--tenant-b-iops") {
             options.tenant_b_iops = std::stod(value);
+        } else if (argument == "--tenant-a-spike-after") {
+            options.tenant_a_spike_after_seconds = std::stod(value);
+        } else if (argument == "--tenant-a-spike-multiplier") {
+            options.tenant_a_spike_multiplier = std::stod(value);
+        } else if (argument == "--tenant-a-request-kib") {
+            options.tenant_a_request_kib = static_cast<std::size_t>(std::stoull(value));
+        } else if (argument == "--tenant-b-request-kib") {
+            options.tenant_b_request_kib = static_cast<std::size_t>(std::stoull(value));
+        } else if (argument == "--tenant-a-access") {
+            options.tenant_a_access = value;
+        } else if (argument == "--tenant-b-access") {
+            options.tenant_b_access = value;
         } else if (argument == "--device-iops") {
             options.device_iops = std::stod(value);
         } else if (argument == "--device-mibps") {
@@ -130,24 +155,46 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + argument);
         }
     }
+    const auto positive_finite = [](double value) {
+        return std::isfinite(value) && value > 0.0;
+    };
     const bool scheduler_valid = options.scheduler == "fifo" ||
         options.scheduler == "token-bucket" || options.scheduler == "drr";
     const bool device_valid = options.device == "simulated" || options.device == "file";
     const bool durability_valid =
         options.file_durability == "buffered" || options.file_durability == "fsync";
-    const bool limits_valid = options.tenant_a_limit_iops > 0.0 &&
-        options.tenant_b_limit_iops > 0.0 &&
-        options.tenant_a_limit_mib_per_sec > 0.0 &&
-        options.tenant_b_limit_mib_per_sec > 0.0 && options.burst_requests >= 1.0 &&
+    const bool access_valid =
+        (options.tenant_a_access == "random" || options.tenant_a_access == "sequential") &&
+        (options.tenant_b_access == "random" || options.tenant_b_access == "sequential");
+    const bool spike_valid = std::isfinite(options.tenant_a_spike_after_seconds) &&
+        positive_finite(options.tenant_a_spike_multiplier) &&
+        (options.tenant_a_spike_after_seconds < 0.0 ||
+        (options.tenant_a_spike_after_seconds > 0.0 &&
+         options.tenant_a_spike_after_seconds < options.duration_seconds &&
+         options.tenant_a_spike_multiplier > 0.0));
+    const bool rates_valid = positive_finite(options.duration_seconds) &&
+        positive_finite(options.tenant_a_iops) && positive_finite(options.tenant_b_iops) &&
+        positive_finite(options.device_iops) && positive_finite(options.device_mib_per_sec);
+    const bool limits_valid = positive_finite(options.tenant_a_limit_iops) &&
+        positive_finite(options.tenant_b_limit_iops) &&
+        positive_finite(options.tenant_a_limit_mib_per_sec) &&
+        positive_finite(options.tenant_b_limit_mib_per_sec) &&
+        std::isfinite(options.burst_requests) && options.burst_requests >= 1.0 &&
         options.tenant_a_weight > 0 && options.tenant_b_weight > 0 &&
         options.drr_quantum_bytes > 0;
     constexpr std::uint64_t kBytesPerMebibyte = 1024ULL * 1024ULL;
     const bool file_size_valid = options.file_size_mib > 0 &&
         options.file_size_mib <=
             std::numeric_limits<std::uint64_t>::max() / kBytesPerMebibyte;
-    if (!scheduler_valid || !device_valid || !durability_valid ||
-        options.duration_seconds <= 0.0 || options.lanes == 0 || !file_size_valid ||
-        options.file_path.empty() || !limits_valid) {
+    const bool request_sizes_valid = options.tenant_a_request_kib > 0 &&
+        options.tenant_b_request_kib > 0 &&
+        options.tenant_a_request_kib <=
+            std::numeric_limits<std::size_t>::max() / 1024U &&
+        options.tenant_b_request_kib <=
+            std::numeric_limits<std::size_t>::max() / 1024U;
+    if (!scheduler_valid || !device_valid || !durability_valid || !access_valid || !spike_valid ||
+        !rates_valid || options.lanes == 0 || !file_size_valid ||
+        options.file_path.empty() || !limits_valid || !request_sizes_valid) {
         throw std::invalid_argument("invalid scheduler or non-positive benchmark setting");
     }
     return options;
@@ -190,16 +237,24 @@ int main(int argc, char** argv) {
         const std::uint64_t working_set_bytes = options.device == "file"
             ? options.file_size_mib * kBytesPerMebibyteInteger
             : 1ULL << 30;
+        const std::size_t tenant_a_request_bytes = options.tenant_a_request_kib * 1024U;
+        const std::size_t tenant_b_request_bytes = options.tenant_b_request_kib * 1024U;
+        if (tenant_a_request_bytes > working_set_bytes ||
+            tenant_b_request_bytes > working_set_bytes) {
+            throw std::invalid_argument("request size exceeds device working set");
+        }
 
         WorkloadConfig tenant_a{
             .tenant_id = "tenant-a-noisy",
             .offered_iops = options.tenant_a_iops,
             .duration = duration,
-            .request_size_bytes = 4 * 1024,
+            .request_size_bytes = tenant_a_request_bytes,
             .working_set_bytes = working_set_bytes,
             .read_ratio = 0.8,
             .arrival_pattern = ArrivalPattern::Fixed,
-            .access_pattern = AccessPattern::Random,
+            .access_pattern = options.tenant_a_access == "random"
+                ? AccessPattern::Random
+                : AccessPattern::Sequential,
             .seed = options.seed,
             .request_id_base = 1,
         };
@@ -207,22 +262,39 @@ int main(int argc, char** argv) {
             .tenant_id = "tenant-b-latency",
             .offered_iops = options.tenant_b_iops,
             .duration = duration,
-            .request_size_bytes = 4 * 1024,
+            .request_size_bytes = tenant_b_request_bytes,
             .working_set_bytes = working_set_bytes,
             .read_ratio = 1.0,
             .arrival_pattern = ArrivalPattern::Fixed,
-            .access_pattern = AccessPattern::Random,
+            .access_pattern = options.tenant_b_access == "random"
+                ? AccessPattern::Random
+                : AccessPattern::Sequential,
             .seed = options.seed + 1,
             .request_id_base = 1'000'000'000ULL,
         };
 
+        std::vector<ScheduledRequest> tenant_a_requests;
+        if (options.tenant_a_spike_after_seconds < 0.0) {
+            tenant_a_requests = WorkloadGenerator::generate(tenant_a);
+        } else {
+            const auto spike_after = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(options.tenant_a_spike_after_seconds));
+            tenant_a_requests = WorkloadGenerator::generate_phased(
+                tenant_a,
+                {
+                    WorkloadPhase{0ns, spike_after, options.tenant_a_iops},
+                    WorkloadPhase{
+                        spike_after,
+                        duration - spike_after,
+                        options.tenant_a_iops * options.tenant_a_spike_multiplier},
+                });
+        }
         auto workload = WorkloadGenerator::merge({
-            WorkloadGenerator::generate(tenant_a),
+            std::move(tenant_a_requests),
             WorkloadGenerator::generate(tenant_b),
         });
 
         constexpr double kBytesPerMebibyte = 1024.0 * 1024.0;
-        constexpr double kRequestBytes = 4.0 * 1024.0;
         std::unique_ptr<IScheduler> scheduler;
         if (options.scheduler == "fifo") {
             scheduler = std::make_unique<FifoScheduler>();
@@ -234,14 +306,14 @@ int main(int argc, char** argv) {
                         options.tenant_a_limit_iops,
                         options.burst_requests,
                         options.tenant_a_limit_mib_per_sec * kBytesPerMebibyte,
-                        options.burst_requests * kRequestBytes,
+                        options.burst_requests * static_cast<double>(tenant_a_request_bytes),
                     },
                     {
                         "tenant-b-latency",
                         options.tenant_b_limit_iops,
                         options.burst_requests,
                         options.tenant_b_limit_mib_per_sec * kBytesPerMebibyte,
-                        options.burst_requests * kRequestBytes,
+                        options.burst_requests * static_cast<double>(tenant_b_request_bytes),
                     },
                 });
         } else {
@@ -253,7 +325,7 @@ int main(int argc, char** argv) {
                         options.tenant_a_limit_iops,
                         options.burst_requests,
                         options.tenant_a_limit_mib_per_sec * kBytesPerMebibyte,
-                        options.burst_requests * kRequestBytes,
+                        options.burst_requests * static_cast<double>(tenant_a_request_bytes),
                     },
                     {
                         "tenant-b-latency",
@@ -261,7 +333,7 @@ int main(int argc, char** argv) {
                         options.tenant_b_limit_iops,
                         options.burst_requests,
                         options.tenant_b_limit_mib_per_sec * kBytesPerMebibyte,
-                        options.burst_requests * kRequestBytes,
+                        options.burst_requests * static_cast<double>(tenant_b_request_bytes),
                     },
                 },
                 options.drr_quantum_bytes);
@@ -315,7 +387,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        const auto measurement_ended_at = Clock::now();
+        const auto measurement_ended_at = started_at + duration;
+        std::this_thread::sleep_until(measurement_ended_at);
         const auto measurement_elapsed = measurement_ended_at - started_at;
         const auto measurement_summaries = metrics.summarize(measurement_elapsed);
         const auto time_series = metrics.summarize_windows(

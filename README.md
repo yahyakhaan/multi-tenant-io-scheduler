@@ -1,7 +1,5 @@
 # IOShield
 
-[![CI](https://github.com/yahyakhaan/multi-tenant-io-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/yahyakhaan/multi-tenant-io-scheduler/actions/workflows/ci.yml)
-
 IOShield is a C++20 multi-tenant I/O QoS scheduler. It is designed to measure
 how queueing, rate limiting, and weighted fair scheduling affect latency
 isolation and device utilization under contention.

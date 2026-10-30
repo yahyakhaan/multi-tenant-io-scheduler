@@ -171,8 +171,8 @@ def write_report(
         )
     lines.extend([
         "",
-        "These are simulator results for policy comparison, not physical-disk claims. "
-        "Raw aggregate and per-second CSV files are stored beside this report.",
+        "Raw aggregate and per-second CSV files are stored beside this report for "
+        "reproduction and further analysis.",
         "",
     ])
     path.write_text("\n".join(lines), encoding="utf-8")

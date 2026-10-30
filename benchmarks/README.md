@@ -45,5 +45,5 @@ python3 benchmarks/run_suite.py --binary build/ioshield_benchmark
 
 The harness uses only the Python standard library. Its outputs go to the ignored
 `benchmark-results/` directory so machine-specific runs do not pollute commits.
-The simulator is intended for controlled policy comparisons; use the file-backed
-device separately to validate the real asynchronous I/O path on a specific host.
+The deterministic simulator enables controlled scheduler comparisons, while the
+file backed device exercises the complete asynchronous I/O path on real storage.
